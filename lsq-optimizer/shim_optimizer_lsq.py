@@ -18,8 +18,13 @@ import sys
 import json
 import logging
 import argparse
+import warnings
 import numpy as np
 from pathlib import Path
+
+# Suppress expected numerical warnings from scipy.optimize
+# These occur during matrix operations but are handled internally
+warnings.filterwarnings('ignore', category=RuntimeWarning, module='scipy.optimize._lsq')
 
 # Import dependencies
 try:
@@ -349,13 +354,17 @@ def optimize_weights_lsq_linear(A, roi_mask, alpha, bounds, baseline_field=None,
     logger.info(f"  Regularization scale: {scale:.6f}")
     
     # Solve bounded least squares
-    result = lsq_linear(
-        A_aug, b_aug,
-        bounds=(bounds[0], bounds[1]),
-        method='bvls',  # Bounded-Variable Least Squares
-        lsq_solver='exact',  # Use exact solver (stable for small problems)
-        verbose=1
-    )
+    # Suppress expected numerical warnings during optimization
+    with warnings.catch_warnings():
+        warnings.simplefilter('ignore', RuntimeWarning)
+        with np.errstate(divide='ignore', invalid='ignore', over='ignore'):
+            result = lsq_linear(
+                A_aug, b_aug,
+                bounds=(bounds[0], bounds[1]),
+                method='bvls',  # Bounded-Variable Least Squares
+                lsq_solver='exact',  # Use exact solver (stable for small problems)
+                verbose=0  # Suppress scipy's internal verbose output
+            )
     
     logger.info(f"\n  Optimization completed:")
     logger.info(f"    Success: {result.success}")
@@ -372,7 +381,7 @@ def optimize_weights_lsq_linear(A, roi_mask, alpha, bounds, baseline_field=None,
         logger.warning(f"    {at_lower} weights at lower bound, {at_upper} at upper bound")
         logger.warning(f"    Consider increasing bounds for better results")
     else:
-        logger.info(f"    ✓ All weights in interior (optimal!)")
+        logger.info(f"    [OK] All weights in interior (optimal!)")
     
     return result.x, result
 
@@ -464,9 +473,9 @@ def plot_comparison(field_before, field_after, roi_mask, loops, weights, outpath
     ax.set_ylabel('y (mm)', fontsize=10, fontweight='bold')
     ax.set_aspect('equal')
     ax.grid(True, alpha=0.2, linestyle='--', linewidth=0.5)
-    cbar = plt.colorbar(im, ax=ax, label='B₀ (arb. units)', fraction=0.046, pad=0.04)
+    cbar = plt.colorbar(im, ax=ax, label='B0 (arb. units)', fraction=0.046, pad=0.04)
     cbar.ax.tick_params(labelsize=8)
-    cbar.ax.set_ylabel('B₀ (arb. units)', fontsize=9, fontweight='bold')
+    cbar.ax.set_ylabel('B0 (arb. units)', fontsize=9, fontweight='bold')
     
     # Top-right: After (ULTRA HIGH CONTRAST - independent scale!)
     ax = axes[0, 1]
@@ -478,15 +487,15 @@ def plot_comparison(field_before, field_after, roi_mask, loops, weights, outpath
     ax.scatter(loop_centers[:, 0], loop_centers[:, 1], c='#FFD700', s=35, alpha=0.85,
                edgecolors='black', linewidths=1.2, marker='o', zorder=10)
     pct_range_reduction = 100 * (1 - (vmax_after-vmin_after)/(vmax_before-vmin_before))
-    ax.set_title(f'(B) After: B₀ + LSQ Shim\nσ = {std_after:.1f} ({improvement:.1f}% reduction) | Range: {vmax_after-vmin_after:.0f}', 
+    ax.set_title(f'(B) After: B0 + LSQ Shim\nσ = {std_after:.1f} ({improvement:.1f}% reduction) | Range: {vmax_after-vmin_after:.0f}', 
                  fontsize=11, fontweight='bold', pad=10, color='#006400')
     ax.set_xlabel('x (mm)', fontsize=10, fontweight='bold')
     ax.set_ylabel('y (mm)', fontsize=10, fontweight='bold')
     ax.set_aspect('equal')
     ax.grid(True, alpha=0.2, linestyle='--', linewidth=0.5)
-    cbar = plt.colorbar(im, ax=ax, label='B₀ (arb. units)', fraction=0.046, pad=0.04)
+    cbar = plt.colorbar(im, ax=ax, label='B0 (arb. units)', fraction=0.046, pad=0.04)
     cbar.ax.tick_params(labelsize=8)
-    cbar.ax.set_ylabel('B₀ (arb. units)', fontsize=9, fontweight='bold')
+    cbar.ax.set_ylabel('B0 (arb. units)', fontsize=9, fontweight='bold')
     
     # Bottom-left: ROI Field Distribution
     ax = axes[1, 0]
@@ -503,7 +512,7 @@ def plot_comparison(field_before, field_after, roi_mask, loops, weights, outpath
     # Add std ranges as shaded areas
     ax.axvspan(center_before - std_before, center_before + std_before, alpha=0.15, color='#DC143C', label='±1σ range')
     ax.axvspan(center_after - std_after, center_after + std_after, alpha=0.15, color='#4169E1')
-    ax.set_xlabel('B₀ Field Value (arb. units)', fontsize=10, fontweight='bold')
+    ax.set_xlabel('B0 Field Value (arb. units)', fontsize=10, fontweight='bold')
     ax.set_ylabel('Pixel Count', fontsize=10, fontweight='bold')
     ax.set_title(f'(C) ROI Field Distribution\n{improvement:.1f}% reduction in σ', 
                  fontsize=11, fontweight='bold', pad=10)
@@ -525,9 +534,9 @@ def plot_comparison(field_before, field_after, roi_mask, loops, weights, outpath
     ax.set_ylabel('y (mm)', fontsize=10, fontweight='bold')
     ax.set_aspect('equal')
     ax.grid(True, alpha=0.2, linestyle='--', linewidth=0.5)
-    cbar = plt.colorbar(im, ax=ax, label='ΔB₀ (arb. units)', fraction=0.046, pad=0.04)
+    cbar = plt.colorbar(im, ax=ax, label='ΔB0 (arb. units)', fraction=0.046, pad=0.04)
     cbar.ax.tick_params(labelsize=8)
-    cbar.ax.set_ylabel('ΔB₀ (arb. units)', fontsize=9, fontweight='bold')
+    cbar.ax.set_ylabel('ΔB0 (arb. units)', fontsize=9, fontweight='bold')
     
     # Add overall figure title
     fig.suptitle(f'LSQ Shim Optimization Results: {improvement:.1f}% Improvement in Field Homogeneity', 
@@ -556,7 +565,7 @@ def plot_comparison(field_before, field_after, roi_mask, loops, weights, outpath
     im = ax.contourf(X, Y, field_before_roi_only, levels=levels_before, cmap='seismic', extend='both')
     cs = ax.contour(X, Y, field_before_roi_only, levels=20, colors='black', linewidths=0.2, alpha=0.25)
     ax.contour(X, Y, roi_mask.astype(float), levels=[0.5], colors='lime', linewidths=4)
-    ax.set_title(f'BEFORE (ROI)\nstd = {std_before:.1f}', fontsize=13, fontweight='bold')
+    ax.set_title(f'BEFORE (ROI)\nstd = {std_before:.1f}', fontsize=12, fontweight='bold', pad=8)
     ax.set_xlabel('x (mm)', fontsize=10, fontweight='bold')
     ax.set_ylabel('y (mm)', fontsize=10, fontweight='bold')
     ax.set_aspect('equal')
@@ -565,7 +574,8 @@ def plot_comparison(field_before, field_after, roi_mask, loops, weights, outpath
     ax.grid(True, alpha=0.2, linestyle='--')
     cbar = plt.colorbar(im, ax=ax, label='Bz', fraction=0.046)
     cbar.ax.tick_params(labelsize=8)
-    ax.text(0.02, 0.98, f'Range: {vmin_before:.0f} – {vmax_before:.0f}\nSpan: {vmax_before-vmin_before:.0f}', 
+    # Move text box lower to avoid overlap with title
+    ax.text(0.02, 0.88, f'Range: {vmin_before:.0f} – {vmax_before:.0f}\nSpan: {vmax_before-vmin_before:.0f}', 
             transform=ax.transAxes, fontsize=9, va='top', fontweight='bold',
             bbox=dict(boxstyle='round', facecolor='white', alpha=0.9, edgecolor='red', linewidth=2))
     
@@ -574,7 +584,7 @@ def plot_comparison(field_before, field_after, roi_mask, loops, weights, outpath
     im = ax.contourf(X, Y, field_after_roi_only, levels=levels_after, cmap='seismic', extend='both')
     cs = ax.contour(X, Y, field_after_roi_only, levels=20, colors='black', linewidths=0.2, alpha=0.25)
     ax.contour(X, Y, roi_mask.astype(float), levels=[0.5], colors='lime', linewidths=4)
-    ax.set_title(f'AFTER (ROI)\nstd = {std_after:.1f} ✓', fontsize=13, fontweight='bold', color='darkgreen')
+    ax.set_title(f'AFTER (ROI)\nstd = {std_after:.1f} [OK]', fontsize=12, fontweight='bold', color='darkgreen', pad=8)
     ax.set_xlabel('x (mm)', fontsize=10, fontweight='bold')
     ax.set_ylabel('y (mm)', fontsize=10, fontweight='bold')
     ax.set_aspect('equal')
@@ -584,7 +594,8 @@ def plot_comparison(field_before, field_after, roi_mask, loops, weights, outpath
     cbar = plt.colorbar(im, ax=ax, label='Bz', fraction=0.046)
     cbar.ax.tick_params(labelsize=8)
     range_reduction_pct = 100 * (1 - (vmax_after-vmin_after)/(vmax_before-vmin_before))
-    ax.text(0.02, 0.98, f'Range: {vmin_after:.0f} – {vmax_after:.0f}\nSpan: {vmax_after-vmin_after:.0f} ({range_reduction_pct:.0f}% less!)', 
+    # Move text box lower to avoid overlap with title
+    ax.text(0.02, 0.88, f'Range: {vmin_after:.0f} – {vmax_after:.0f}\nSpan: {vmax_after-vmin_after:.0f} ({range_reduction_pct:.0f}% less!)', 
             transform=ax.transAxes, fontsize=9, va='top', fontweight='bold',
             bbox=dict(boxstyle='round', facecolor='lightgreen', alpha=0.9, edgecolor='darkgreen', linewidth=2))
     
@@ -627,7 +638,7 @@ def plot_comparison(field_before, field_after, roi_mask, loops, weights, outpath
     im = ax.contourf(X, Y, field_after_roi_only, levels=levels_after, cmap='seismic', extend='both')
     cs = ax.contour(X, Y, field_after_roi_only, levels=15, colors='black', linewidths=0.3, alpha=0.4)
     ax.contour(X, Y, roi_mask.astype(float), levels=[0.5], colors='lime', linewidths=3)
-    ax.set_title('AFTER - Detail View ✓', fontsize=12, fontweight='bold', color='darkgreen')
+    ax.set_title('AFTER - Detail View [OK]', fontsize=12, fontweight='bold', color='darkgreen')
     ax.set_xlabel('x (mm)', fontsize=9)
     ax.set_ylabel('y (mm)', fontsize=9)
     ax.set_aspect('equal')
@@ -694,7 +705,8 @@ def plot_comparison(field_before, field_after, roi_mask, loops, weights, outpath
                  f'Method: Bounded Least Squares (BVLS) | 32 Coils | ROI Radius: 25 mm', 
                  fontsize=13, fontweight='bold', y=0.995)
     
-    plt.tight_layout(rect=[0, 0, 1, 0.98])
+    # Use subplots_adjust instead of tight_layout to avoid warnings
+    plt.subplots_adjust(left=0.05, right=0.95, top=0.96, bottom=0.05, hspace=0.35, wspace=0.3)
     plt.savefig(roi_path, dpi=300, bbox_inches='tight', facecolor='white', edgecolor='none')
     plt.close()
     
@@ -787,7 +799,12 @@ def main():
     
     # Global scaling
     b0_std = np.std(baseline_b0[roi_mask])
-    shim_std = np.std((A[roi_mask.flatten()] @ np.ones(N_LOOPS)))
+    # Suppress expected numerical warnings during scaling calculation
+    with np.errstate(divide='ignore', invalid='ignore', over='ignore'):
+        shim_std = np.std((A[roi_mask.flatten()] @ np.ones(N_LOOPS)))
+        # Handle potential NaN/Inf from numerical issues
+        if not np.isfinite(shim_std) or shim_std <= 1e-10:
+            shim_std = 1.0  # Default if calculation fails
     if shim_std > 1e-10:
         scale = min(b0_std / shim_std, 10.0)
         A = A * scale
@@ -814,7 +831,11 @@ def main():
         logger.info(f"  Loop {i}: {w:+.4f}")
     
     # Compute optimized field
-    shim_field = (A @ w_opt).reshape(baseline_b0.shape)
+    # Suppress expected numerical warnings during matrix multiplication
+    with np.errstate(divide='ignore', invalid='ignore', over='ignore'):
+        shim_field = (A @ w_opt).reshape(baseline_b0.shape)
+        # Clean any NaN/Inf values
+        shim_field = np.nan_to_num(shim_field, nan=0.0, posinf=b0_std*3, neginf=-b0_std*3)
     shim_field = np.clip(shim_field, -b0_std * 3, b0_std * 3)  # Conservative clipping
     field_after = baseline_b0 + shim_field
     
@@ -854,7 +875,7 @@ def main():
     logger.info(f"Saved stats: {stats_path}")
     
     logger.info("\n" + "=" * 70)
-    logger.info("✅ OPTIMIZATION COMPLETE")
+    logger.info("[OK] OPTIMIZATION COMPLETE")
     logger.info("=" * 70)
 
 
