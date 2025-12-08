@@ -1,51 +1,68 @@
 """
-RF-Shimming Exploration Script
+RF-Shimming Analysis Script
 
-This script performs exploratory RF-shimming analysis on processed outputs from the
-ds004906 (rf-shimming-7t) OpenNeuro dataset. It implements phase-only and regularized
-least-squares complex-weight shimming within the spinal cord ROI.
+This script analyzes already-shimmed B1 maps from the ds004906 (rf-shimming-7t) OpenNeuro dataset.
+It compares different RF shimming methods (CP, CoV, patient, phase, volume, target, SAReff) by
+extracting metrics from the flip angle maps and converting them to B1+ efficiency.
 
-IMPORTANT LIMITATIONS:
-- This script uses processed dataset files and does not re-run the original heavy
-  pipeline (SCT/Shimming Toolbox). It assumes B1 maps and masks are already available.
-- The analysis is exploratory and works on a single central slice to keep runtime
-  under 15 minutes on Mac M4.
+The script follows the methodology from the reference implementation but simplified for
+single-subject, single-slice analysis.
 
-Data source: ds004906 (rf-shimming-7t) — used for exploratory analysis only.
+Data source: ds004906 (rf-shimming-7t)
 Dataset available at: https://openneuro.org/datasets/ds004906
+Reference: https://github.com/shimming-toolbox/rf-shimming-7t
 """
 
 import os
 import glob
+import json
 import numpy as np
 import nibabel as nib
 from pathlib import Path
 import pandas as pd
 import matplotlib.pyplot as plt
-from scipy import ndimage, optimize
-from scipy.ndimage import label, find_objects
+from scipy.ndimage import label
 from skimage.transform import resize
 import warnings
 warnings.filterwarnings('ignore')
+
+# Get script directory for relative paths
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 # ============================================================================
 # CONFIGURATION
 # ============================================================================
 
-# User must edit this path to point to local ds004906 folder
-DATASET_DIR = "/Users/matiasrodlo/Documents/github/shimming/dataset"
+# Dataset directory - relative to script location
+# From analysis/01/, dataset is at ../../dataset
+# Falls back to absolute path if relative doesn't exist
+_relative_dataset = os.path.join(SCRIPT_DIR, "..", "..", "dataset")
+_absolute_dataset = "/Users/matiasrodlo/Documents/github/shiming/dataset"
+
+if os.path.exists(_relative_dataset):
+    DATASET_DIR = os.path.abspath(_relative_dataset)
+elif os.path.exists(_absolute_dataset):
+    DATASET_DIR = _absolute_dataset
+else:
+    # Default: user must edit this path
+    DATASET_DIR = "/path/to/dataset"
 
 # Subject selection: None = auto-select first subject found
 SUBJECT = None
 
 # Output directory (will be created if missing)
-OUTPUT_DIR = "analysis/analysis_outputs"
+# Relative to script location
+OUTPUT_DIR = os.path.join(SCRIPT_DIR, "analysis_outputs")
 
 # Maximum image dimension for processing (downsample if larger)
 DOWNSAMPLE_MAX = 256
 
-# Regularization parameter for LS shim
-ALPHA = 1e-3
+# Physical constants for B1+ efficiency conversion
+GAMMA = 2.675e8  # [rad / (s T)] - gyromagnetic ratio
+REQUESTED_FA = 90  # saturation flip angle (degrees) - hard-coded in sequence
+
+# Available shimming methods in the dataset
+SHIMMING_METHODS = ["CP", "CoV", "patient", "phase", "volume", "target", "SAReff"]
 
 # ============================================================================
 # HELPER FUNCTIONS
@@ -83,7 +100,7 @@ def check_dependencies():
 
 def find_subjects_and_files(dataset_dir, subject=None):
     """
-    Find subject folders and B1 map files.
+    Find subject folders and available shimming method files.
     
     Parameters:
     -----------
@@ -96,15 +113,15 @@ def find_subjects_and_files(dataset_dir, subject=None):
     --------
     subject_id : str
         Selected subject ID
-    b1_files : list
-        List of B1 map file paths
+    shim_files : dict
+        Dictionary mapping shim method names to file paths
     mask_files : list
         List of mask/segmentation file paths
     """
     if not os.path.exists(dataset_dir):
         raise FileNotFoundError(
             f"Dataset directory not found: {dataset_dir}\n"
-            f"Please edit DATASET_DIR in the script to point to your local ds004906 folder."
+            f"Please edit DATASET_DIR in the script to point to your local dataset folder."
         )
     
     # Find all subject folders
@@ -132,35 +149,25 @@ def find_subjects_and_files(dataset_dir, subject=None):
     if not os.path.exists(fmap_dir):
         raise FileNotFoundError(f"fmap directory not found: {fmap_dir}")
     
-    # Search for B1 maps
-    b1_patterns = [
-        "*_TB1map.nii*",
-        "*famp*_TB1TFL.nii*",
-        "*acq-*_TB1TFL.nii*"
-    ]
+    # Search for flip angle maps (famp* files) for each shimming method
+    shim_files = {}
+    for shim_method in SHIMMING_METHODS:
+        # Pattern: sub-XX_acq-famp{method}_TB1TFL.nii.gz
+        pattern = os.path.join(fmap_dir, f"{subject_id}_acq-famp{shim_method}_TB1TFL.nii.gz")
+        if os.path.exists(pattern):
+            shim_files[shim_method] = pattern
+        else:
+            print(f"Warning: {shim_method} shimming method not found for {subject_id}")
     
-    b1_files = []
-    for pattern in b1_patterns:
-        matches = glob.glob(os.path.join(fmap_dir, pattern))
-        b1_files.extend(matches)
-    
-    # Prefer TB1map files if multiple exist
-    tb1map_files = [f for f in b1_files if "_TB1map" in f]
-    if tb1map_files:
-        b1_files = tb1map_files
-    
-    b1_files = sorted(list(set(b1_files)))
-    
-    if not b1_files:
+    if not shim_files:
         raise FileNotFoundError(
-            f"No B1 maps found in {fmap_dir}\n"
-            f"Searched for patterns: {b1_patterns}\n"
-            f"Please ensure processed B1 maps are available in the fmap directory."
+            f"No shimming method files found in {fmap_dir}\n"
+            f"Expected pattern: {subject_id}_acq-famp*_TB1TFL.nii.gz"
         )
     
-    print(f"Found B1 map files:")
-    for f in b1_files:
-        print(f"  {f}")
+    print(f"\nFound {len(shim_files)} shimming methods:")
+    for method, filepath in shim_files.items():
+        print(f"  {method}: {os.path.basename(filepath)}")
     
     # Search for masks/segmentations
     mask_patterns = [
@@ -177,119 +184,101 @@ def find_subjects_and_files(dataset_dir, subject=None):
     labels_dir = os.path.join(dataset_dir, "derivatives", "labels", subject_id)
     if os.path.exists(labels_dir):
         for pattern in mask_patterns:
-            matches = glob.glob(os.path.join(labels_dir, pattern))
+            matches = glob.glob(os.path.join(labels_dir, "**", pattern), recursive=True)
             mask_files.extend(matches)
     
     mask_files = sorted(list(set(mask_files)))
     
     if mask_files:
-        print(f"Found mask/segmentation files:")
-        for f in mask_files:
-            print(f"  {f}")
+        print(f"\nFound {len(mask_files)} mask/segmentation files")
     else:
-        print("No mask files found - will use auto-ROI")
+        print("\nNo mask files found - will use auto-ROI")
     
-    return subject_id, b1_files, mask_files
+    return subject_id, shim_files, mask_files
 
 
-def load_maps(b1_files):
+def load_flip_angle_map(famp_file):
     """
-    Load B1 maps from NIfTI files.
+    Load flip angle map from NIfTI file.
     
     Parameters:
     -----------
-    b1_files : list
-        List of B1 map file paths
+    famp_file : str
+        Path to flip angle map NIfTI file
     
     Returns:
     --------
-    channels : np.ndarray
-        Complex array of shape (C, H, W) where C is number of channels
-    is_synthetic : bool
-        True if channels were synthetically generated
+    fa_map : np.ndarray
+        Flip angle map (2D or 3D)
     """
-    all_data = []
-    is_complex = False
+    img = nib.load(famp_file)
+    fa_map = img.get_fdata()
     
-    for b1_file in b1_files:
-        img = nib.load(b1_file)
-        data = img.get_fdata()
-        
-        # Handle 4D data (channels in first dimension)
-        if data.ndim == 4:
-            # Take central slice for all channels
-            z_slice = data.shape[2] // 2
-            data = data[:, :, z_slice, :]
-            # Reshape to (C, H, W)
-            if data.shape[0] < data.shape[-1]:
-                data = np.transpose(data, (2, 0, 1))
-            else:
-                data = np.transpose(data, (0, 1, 2))
-        
-        # Handle 3D data
-        elif data.ndim == 3:
-            # Select central slice with largest ROI (or middle slice)
-            z_slice = data.shape[2] // 2
-            data = data[:, :, z_slice]
-        
-        # Handle 2D data
-        elif data.ndim == 2:
-            pass
-        else:
-            raise ValueError(f"Unsupported data dimensions: {data.ndim}D")
-        
-        # Check if complex
-        if np.iscomplexobj(data):
-            is_complex = True
-            all_data.append(data)
-        else:
-            # Real-valued magnitude
-            all_data.append(data.astype(np.float32))
-    
-    if not all_data:
-        raise ValueError("No data loaded from B1 files")
-    
-    # Stack channels
-    if len(all_data) == 1:
-        # Single channel - check if we need to create synthetic channels
-        base_map = all_data[0]
-        if not is_complex:
-            print("Only real-valued magnitude map found - generating synthetic complex channels")
-            # Generate C=4 synthetic complex channels
-            # Apply small spatial shifts and random phases
-            np.random.seed(42)  # For reproducibility
-            channels = []
-            for c in range(4):
-                # Small random shift
-                shift_y = np.random.uniform(-2, 2)
-                shift_x = np.random.uniform(-2, 2)
-                shifted = ndimage.shift(base_map, (shift_y, shift_x), mode='nearest')
-                # Random phase
-                phase = np.random.uniform(0, 2*np.pi)
-                # Create complex channel
-                complex_ch = shifted * np.exp(1j * phase)
-                channels.append(complex_ch)
-            channels = np.array(channels)
-            is_synthetic = True
-        else:
-            # Single complex channel - duplicate to create 4 channels
-            channels = np.array([base_map] * 4)
-            is_synthetic = False
+    # Handle 3D data - select central slice
+    if fa_map.ndim == 3:
+        z_slice = fa_map.shape[2] // 2
+        fa_map = fa_map[:, :, z_slice]
+    elif fa_map.ndim == 2:
+        pass
     else:
-        # Multiple channels
-        channels = np.array(all_data)
-        is_synthetic = False
+        raise ValueError(f"Unsupported data dimensions: {fa_map.ndim}D")
     
-    # Ensure channels are complex
-    if not np.iscomplexobj(channels):
-        # Convert magnitude to complex with zero phase
-        channels = channels.astype(np.complex64)
+    return fa_map
+
+
+def convert_to_b1plus_efficiency(famp_file, fa_map):
+    """
+    Convert flip angle map to B1+ efficiency in nT/V units.
     
-    print(f"Loaded {channels.shape[0]} channels, shape: {channels.shape[1:]}")
-    if is_synthetic:
-        print("WARNING: Using synthetic complex channels (generated from single magnitude map)")
+    Based on reference implementation (rf-shimming-7t notebook, Cell 40).
+    The approach calculates B1+ efficiency using a 1ms, pi-pulse at the acquisition
+    voltage, then scales by the ratio of measured to requested flip angle.
     
-    return channels, is_synthetic
+    Parameters:
+    -----------
+    famp_file : str
+        Path to flip angle map file (used to get JSON metadata)
+    fa_map : np.ndarray
+        Flip angle map in degrees (Siemens format: actual value * 10)
+    
+    Returns:
+    --------
+    b1_map : np.ndarray
+        B1+ efficiency map in nT/V
+    """
+    # Load JSON metadata to get reference voltage
+    json_file = famp_file.replace('.nii.gz', '.json').replace('.nii', '.json')
+    
+    if not os.path.exists(json_file):
+        raise FileNotFoundError(f"JSON sidecar not found: {json_file}")
+    
+    with open(json_file, 'r') as f:
+        metadata = json.load(f)
+    
+    ref_voltage = metadata.get("TxRefAmp", None)
+    if ref_voltage is None:
+        # Try alternative field name
+        ref_voltage = metadata.get("TraRefAmpl", None)
+        if ref_voltage is None:
+            raise ValueError(f"Could not find TxRefAmp or TraRefAmpl in {json_file}")
+    
+    print(f"  Reference voltage: {ref_voltage} V")
+    
+    # Siemens maps are in units of flip angle * 10 (in degrees)
+    acquired_fa = fa_map / 10.0  # Convert to actual degrees
+    
+    # Account for power loss between coil and socket (given by Siemens)
+    voltage_at_socket = ref_voltage * (10 ** -0.095)
+    
+    # Compute B1 map in [T/V]
+    # Formula: B1 = (acquired_fa / requested_fa) * (pi / (gamma * pulse_duration * voltage))
+    # pulse_duration = 1e-3 s (1 ms)
+    b1_map = (acquired_fa / REQUESTED_FA) * (np.pi / (GAMMA * 1e-3 * voltage_at_socket))
+    
+    # Convert to [nT/V]
+    b1_map = b1_map * 1e9
+    
+    return b1_map
 
 
 def downsample_if_needed(data, max_dim=DOWNSAMPLE_MAX):
@@ -319,33 +308,26 @@ def downsample_if_needed(data, max_dim=DOWNSAMPLE_MAX):
     scale = max_dim / max_side
     new_h, new_w = int(h * scale), int(w * scale)
     
-    print(f"Downsampling from ({h}, {w}) to ({new_h}, {new_w}) (scale={scale:.3f})")
+    print(f"  Downsampling from ({h}, {w}) to ({new_h}, {new_w}) (scale={scale:.3f})")
     
-    if data.ndim == 2:
-        resized = resize(data, (new_h, new_w), preserve_range=True, anti_aliasing=True)
-    else:
-        # Multi-channel: resize each channel
-        resized = np.zeros((data.shape[0], new_h, new_w), dtype=data.dtype)
-        for c in range(data.shape[0]):
-            resized[c] = resize(data[c], (new_h, new_w), preserve_range=True, anti_aliasing=True)
+    resized = resize(data, (new_h, new_w), preserve_range=True, anti_aliasing=True)
     
     return resized, scale
 
 
-def auto_roi(channels, mask_files=None):
+def auto_roi(b1_map, mask_files=None):
     """
-    Automatically determine ROI for shimming.
+    Automatically determine ROI for analysis.
     
     Strategy priority:
-    1. Use existing shimming mask if available
-    2. Use spinal cord segmentation (restricted to C3-T2 if labels available)
-    3. Auto-threshold at 30% max, largest connected component
-    4. Centered circular ROI (fallback)
+    1. Use existing segmentation mask if available
+    2. Auto-threshold at 30% max, largest connected component
+    3. Centered circular ROI (fallback)
     
     Parameters:
     -----------
-    channels : np.ndarray
-        Channel data of shape (C, H, W)
+    b1_map : np.ndarray
+        B1+ efficiency map of shape (H, W)
     mask_files : list, optional
         List of mask file paths
     
@@ -356,7 +338,7 @@ def auto_roi(channels, mask_files=None):
     strategy : str
         Description of ROI strategy used
     """
-    h, w = channels.shape[1:]
+    h, w = b1_map.shape
     roi = np.zeros((h, w), dtype=bool)
     
     # Strategy 1: Load existing mask
@@ -368,7 +350,6 @@ def auto_roi(channels, mask_files=None):
                 
                 # Handle 3D/4D masks
                 if mask_data.ndim >= 3:
-                    # Use central slice
                     z_slice = mask_data.shape[2] // 2 if mask_data.ndim >= 3 else 0
                     mask_data = mask_data[:, :, z_slice] if mask_data.ndim == 3 else mask_data[:, :, z_slice, 0]
                 
@@ -388,15 +369,12 @@ def auto_roi(channels, mask_files=None):
                 continue
     
     # Strategy 2: Threshold-based auto-ROI
-    # Use combined magnitude
-    mag_combined = np.abs(np.sum(channels, axis=0))
-    threshold = 0.3 * np.max(mag_combined)
-    roi_binary = mag_combined > threshold
+    threshold = 0.3 * np.max(b1_map)
+    roi_binary = b1_map > threshold
     
     # Find largest connected component
     labeled, num_features = label(roi_binary)
     if num_features > 0:
-        # Get sizes of components
         sizes = [np.sum(labeled == i) for i in range(1, num_features + 1)]
         largest_idx = np.argmax(sizes) + 1
         roi = labeled == largest_idx
@@ -415,14 +393,14 @@ def auto_roi(channels, mask_files=None):
     return roi, strategy
 
 
-def compute_metrics(field, roi):
+def compute_metrics(b1_map, roi):
     """
     Compute shimming metrics (mean, std, CV) inside ROI.
     
     Parameters:
     -----------
-    field : np.ndarray
-        Combined field (magnitude) of shape (H, W)
+    b1_map : np.ndarray
+        B1+ efficiency map of shape (H, W) in nT/V
     roi : np.ndarray
         Boolean mask of shape (H, W)
     
@@ -431,181 +409,100 @@ def compute_metrics(field, roi):
     metrics : dict
         Dictionary with 'mean', 'std', 'cv' keys
     """
-    roi_values = field[roi]
+    roi_values = b1_map[roi]
     mean = np.mean(roi_values)
     std = np.std(roi_values)
-    cv = std / mean if mean > 0 else np.inf
+    cv = (std / mean) * 100 if mean > 0 else np.inf  # CV as percentage
     
     return {'mean': mean, 'std': std, 'cv': cv}
 
 
-def phase_only_shim(channels, roi):
+def save_outputs(metrics_df, b1_maps, roi, output_dir, subject_id):
     """
-    Compute phase-only shimming weights.
-    
-    For each channel, compute the mean phase in ROI and set weight to exp(-1j * phi_c).
-    Amplitudes are normalized to 1.
-    
-    Parameters:
-    -----------
-    channels : np.ndarray
-        Complex channel data of shape (C, H, W)
-    roi : np.ndarray
-        Boolean mask of shape (H, W)
-    
-    Returns:
-    --------
-    weights : np.ndarray
-        Complex weights of shape (C,)
-    combined_field : np.ndarray
-        Combined field magnitude of shape (H, W)
-    """
-    C = channels.shape[0]
-    weights = np.zeros(C, dtype=np.complex64)
-    
-    for c in range(C):
-        # Compute mean phase in ROI
-        roi_values = channels[c][roi]
-        mean_phase = np.angle(np.mean(roi_values))
-        # Set weight to conjugate phase (normalize amplitude to 1)
-        weights[c] = np.exp(-1j * mean_phase)
-    
-    # Combine channels
-    combined = np.sum(weights[:, np.newaxis, np.newaxis] * channels, axis=0)
-    combined_field = np.abs(combined)
-    
-    return weights, combined_field
-
-
-def ls_complex_shim(channels, roi, alpha=ALPHA):
-    """
-    Compute regularized least-squares complex shimming weights.
-    
-    Solves: min ||A w - t||^2 + alpha ||w||^2
-    where A is design matrix (Npix x C), w are complex weights, t is target (ones).
-    
-    Parameters:
-    -----------
-    channels : np.ndarray
-        Complex channel data of shape (C, H, W)
-    roi : np.ndarray
-        Boolean mask of shape (H, W)
-    alpha : float
-        Regularization parameter
-    
-    Returns:
-    --------
-    weights : np.ndarray
-        Complex weights of shape (C,)
-    combined_field : np.ndarray
-        Combined field magnitude of shape (H, W)
-    """
-    C = channels.shape[0]
-    roi_pixels = channels[:, roi]  # Shape: (C, Npix)
-    Npix = roi_pixels.shape[1]
-    
-    # Build design matrix A (Npix x C) - each row is a pixel, each col is a channel
-    A = roi_pixels.T  # Shape: (Npix, C)
-    
-    # Target: uniform field (ones)
-    target = np.ones(Npix, dtype=np.complex64)
-    
-    # Convert to real-valued problem: [Re(w); Im(w)]
-    # A_real = [Re(A) -Im(A); Im(A) Re(A)]
-    A_real = np.zeros((2*Npix, 2*C), dtype=np.float32)
-    A_real[:Npix, :C] = A.real
-    A_real[:Npix, C:] = -A.imag
-    A_real[Npix:, :C] = A.imag
-    A_real[Npix:, C:] = A.real
-    
-    target_real = np.concatenate([target.real, target.imag])
-    
-    # Regularization matrix: alpha * I
-    reg_matrix = alpha * np.eye(2*C)
-    
-    # Solve: (A^T A + alpha*I) w = A^T t
-    # Using scipy.optimize for robustness
-    def objective(w_real):
-        w_real = w_real.reshape(-1)
-        residual = A_real @ w_real - target_real
-        reg_term = alpha * np.sum(w_real**2)
-        return np.sum(residual**2) + reg_term
-    
-    # Initial guess: zeros
-    w0 = np.zeros(2*C)
-    
-    # Optimize
-    result = optimize.minimize(objective, w0, method='L-BFGS-B')
-    w_real = result.x
-    
-    # Convert back to complex
-    weights = w_real[:C] + 1j * w_real[C:]
-    
-    # Combine channels
-    combined = np.sum(weights[:, np.newaxis, np.newaxis] * channels, axis=0)
-    combined_field = np.abs(combined)
-    
-    return weights, combined_field
-
-
-def save_outputs(metrics_df, baseline_field, phase_field, ls_field, roi, output_dir):
-    """
-    Save metrics CSV and before/after visualization.
+    Save metrics CSV and visualization comparing shimming methods.
     
     Parameters:
     -----------
     metrics_df : pd.DataFrame
-        DataFrame with metrics for each method
-    baseline_field : np.ndarray
-        Baseline combined field
-    phase_field : np.ndarray
-        Phase-only shimmed field
-    ls_field : np.ndarray
-        LS shimmed field
+        DataFrame with metrics for each shimming method
+    b1_maps : dict
+        Dictionary mapping shim method names to B1+ efficiency maps
     roi : np.ndarray
         ROI mask
     output_dir : str
         Output directory path
+    subject_id : str
+        Subject ID
     """
     os.makedirs(output_dir, exist_ok=True)
     
     # Save CSV
     csv_path = os.path.join(output_dir, "rf_shim_metrics.csv")
     metrics_df.to_csv(csv_path, index=False)
-    print(f"Saved metrics: {csv_path}")
+    print(f"\nSaved metrics: {csv_path}")
     
-    # Create figure
-    fig = plt.figure(figsize=(15, 5))
+    # Create figure comparing all shimming methods
+    n_methods = len(b1_maps)
+    n_cols = 4
+    n_rows = (n_methods + n_cols - 1) // n_cols
     
-    # Three panels for fields
-    fields = [baseline_field, phase_field, ls_field]
-    titles = ["Baseline", "Phase-only", "LS Complex"]
+    fig = plt.figure(figsize=(16, 4 * n_rows))
     
-    for i, (field, title) in enumerate(zip(fields, titles)):
-        ax = plt.subplot(1, 3, i + 1)
-        im = ax.imshow(field, cmap='hot', aspect='auto')
-        # Overlay ROI contour
+    methods = sorted(b1_maps.keys())
+    
+    for i, method in enumerate(methods):
+        ax = plt.subplot(n_rows, n_cols, i + 1)
+        
+        b1_map = b1_maps[method]
+        
+        # Get metrics for this method
+        method_metrics = metrics_df[metrics_df['Method'] == method].iloc[0]
+        mean_val = method_metrics['Mean']
+        cv_val = method_metrics['CV']
+        
+        # Display B1+ map
+        im = ax.imshow(b1_map, cmap='viridis', aspect='auto', vmin=5, vmax=30)
         ax.contour(roi, colors='cyan', linewidths=1.5, alpha=0.7)
-        ax.set_title(title, fontsize=12, fontweight='bold')
+        ax.set_title(f"{method}\n{mean_val:.2f} nT/V, CV: {cv_val:.2f}%", 
+                    fontsize=12, fontweight='bold')
         ax.axis('off')
-        plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+        plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04, label='B1+ [nT/V]')
     
-    # Add metrics bar chart as inset
-    ax_inset = fig.add_axes([0.02, 0.02, 0.25, 0.25])
-    methods = metrics_df['Method'].values
-    cvs = metrics_df['CV'].values
-    ax_inset.bar(methods, cvs, color=['red', 'green', 'blue'], alpha=0.7)
-    ax_inset.set_ylabel('CV', fontsize=9)
-    ax_inset.set_title('Coefficient of Variation', fontsize=9, fontweight='bold')
-    ax_inset.tick_params(labelsize=8)
-    plt.setp(ax_inset.xaxis.get_majorticklabels(), rotation=45, ha='right')
-    
+    plt.suptitle(f'B1+ Efficiency Maps - {subject_id}', fontsize=16, fontweight='bold', y=0.995)
     plt.tight_layout()
     
     # Save figure
-    png_path = os.path.join(output_dir, "rf_shim_before_after.png")
+    png_path = os.path.join(output_dir, "rf_shim_comparison.png")
     plt.savefig(png_path, dpi=200, bbox_inches='tight')
     print(f"Saved figure: {png_path}")
+    plt.close()
+    
+    # Create bar chart comparing CV across methods
+    fig, ax = plt.subplots(figsize=(10, 6))
+    methods = metrics_df['Method'].values
+    cvs = metrics_df['CV'].values
+    means = metrics_df['Mean'].values
+    
+    x_pos = np.arange(len(methods))
+    bars = ax.bar(x_pos, cvs, alpha=0.7, color='steelblue')
+    ax.set_xlabel('Shimming Method', fontsize=12, fontweight='bold')
+    ax.set_ylabel('Coefficient of Variation (%)', fontsize=12, fontweight='bold')
+    ax.set_title(f'B1+ Homogeneity Comparison - {subject_id}', fontsize=14, fontweight='bold')
+    ax.set_xticks(x_pos)
+    ax.set_xticklabels(methods, rotation=45, ha='right')
+    ax.grid(True, alpha=0.3, axis='y')
+    
+    # Add value labels on bars
+    for i, (bar, cv, mean) in enumerate(zip(bars, cvs, means)):
+        height = bar.get_height()
+        ax.text(bar.get_x() + bar.get_width()/2., height,
+                f'{cv:.2f}%\n({mean:.2f} nT/V)',
+                ha='center', va='bottom', fontsize=9)
+    
+    plt.tight_layout()
+    bar_path = os.path.join(output_dir, "rf_shim_cv_comparison.png")
+    plt.savefig(bar_path, dpi=200, bbox_inches='tight')
+    print(f"Saved bar chart: {bar_path}")
     plt.close()
 
 
@@ -616,7 +513,8 @@ def save_outputs(metrics_df, baseline_field, phase_field, ls_field, roi, output_
 def main():
     """Main execution function."""
     print("=" * 70)
-    print("RF-Shimming Exploration Script")
+    print("RF-Shimming Analysis Script")
+    print("Analyzing already-shimmed B1 maps from ds004906 dataset")
     print("=" * 70)
     
     # Check dependencies
@@ -631,78 +529,82 @@ def main():
     
     # Find subjects and files
     print(f"\n{'='*70}")
-    print("Step 1: Finding subjects and B1 maps")
+    print("Step 1: Finding subjects and shimming method files")
     print(f"{'='*70}")
-    subject_id, b1_files, mask_files = find_subjects_and_files(DATASET_DIR, SUBJECT)
+    subject_id, shim_files, mask_files = find_subjects_and_files(DATASET_DIR, SUBJECT)
     
-    # Load maps
+    # Process each shimming method
     print(f"\n{'='*70}")
-    print("Step 2: Loading B1 maps")
+    print("Step 2: Loading and converting flip angle maps to B1+ efficiency")
     print(f"{'='*70}")
-    channels, is_synthetic = load_maps(b1_files)
     
-    # Downsample if needed
-    print(f"\n{'='*70}")
-    print("Step 3: Preprocessing")
-    print(f"{'='*70}")
-    channels, scale = downsample_if_needed(channels, DOWNSAMPLE_MAX)
+    b1_maps = {}
+    all_metrics = []
     
-    # Determine ROI
+    for method, famp_file in shim_files.items():
+        print(f"\nProcessing {method} shimming method...")
+        print(f"  File: {os.path.basename(famp_file)}")
+        
+        # Load flip angle map
+        fa_map = load_flip_angle_map(famp_file)
+        
+        # Convert to B1+ efficiency
+        b1_map = convert_to_b1plus_efficiency(famp_file, fa_map)
+        
+        # Downsample if needed
+        b1_map, scale = downsample_if_needed(b1_map, DOWNSAMPLE_MAX)
+        
+        b1_maps[method] = b1_map
+        print(f"  B1+ map shape: {b1_map.shape}, range: [{np.min(b1_map):.2f}, {np.max(b1_map):.2f}] nT/V")
+    
+    # Determine ROI (use first B1 map as reference)
     print(f"\n{'='*70}")
-    print("Step 4: ROI selection")
+    print("Step 3: ROI selection")
     print(f"{'='*70}")
-    roi, roi_strategy = auto_roi(channels, mask_files)
+    first_method = list(b1_maps.keys())[0]
+    roi, roi_strategy = auto_roi(b1_maps[first_method], mask_files)
     print(f"ROI size: {np.sum(roi)} pixels ({100*np.sum(roi)/roi.size:.1f}% of image)")
     
-    # Baseline metrics
+    # Compute metrics for each method
     print(f"\n{'='*70}")
-    print("Step 5: Baseline metrics")
+    print("Step 4: Computing metrics for each shimming method")
     print(f"{'='*70}")
-    baseline_combined = np.abs(np.sum(channels, axis=0))
-    baseline_metrics = compute_metrics(baseline_combined, roi)
-    print(f"Baseline - Mean: {baseline_metrics['mean']:.4f}, "
-          f"Std: {baseline_metrics['std']:.4f}, "
-          f"CV: {baseline_metrics['cv']:.4f}")
     
-    # Phase-only shim
+    for method, b1_map in b1_maps.items():
+        metrics = compute_metrics(b1_map, roi)
+        all_metrics.append({
+            'Method': method,
+            'Mean': metrics['mean'],
+            'Std': metrics['std'],
+            'CV': metrics['cv']
+        })
+        print(f"{method:10s} - Mean: {metrics['mean']:7.2f} nT/V, "
+              f"Std: {metrics['std']:6.2f} nT/V, CV: {metrics['cv']:6.2f}%")
+    
+    # Create DataFrame
+    metrics_df = pd.DataFrame(all_metrics)
+    
+    # Sort by CV (lower is better for homogeneity)
+    metrics_df = metrics_df.sort_values('CV')
     print(f"\n{'='*70}")
-    print("Step 6: Phase-only shimming")
+    print("Results sorted by CV (Coefficient of Variation - lower is better):")
     print(f"{'='*70}")
-    phase_weights, phase_field = phase_only_shim(channels, roi)
-    phase_metrics = compute_metrics(phase_field, roi)
-    print(f"Phase-only - Mean: {phase_metrics['mean']:.4f}, "
-          f"Std: {phase_metrics['std']:.4f}, "
-          f"CV: {phase_metrics['cv']:.4f}")
-    
-    # LS complex shim
-    print(f"\n{'='*70}")
-    print("Step 7: LS complex shimming")
-    print(f"{'='*70}")
-    ls_weights, ls_field = ls_complex_shim(channels, roi, ALPHA)
-    ls_metrics = compute_metrics(ls_field, roi)
-    print(f"LS complex - Mean: {ls_metrics['mean']:.4f}, "
-          f"Std: {ls_metrics['std']:.4f}, "
-          f"CV: {ls_metrics['cv']:.4f}")
-    
-    # Compile metrics
-    metrics_df = pd.DataFrame({
-        'Method': ['Baseline', 'Phase-only', 'LS Complex'],
-        'Mean': [baseline_metrics['mean'], phase_metrics['mean'], ls_metrics['mean']],
-        'Std': [baseline_metrics['std'], phase_metrics['std'], ls_metrics['std']],
-        'CV': [baseline_metrics['cv'], phase_metrics['cv'], ls_metrics['cv']]
-    })
+    print(metrics_df.to_string(index=False))
     
     # Save outputs
     print(f"\n{'='*70}")
-    print("Step 8: Saving outputs")
+    print("Step 5: Saving outputs")
     print(f"{'='*70}")
-    save_outputs(metrics_df, baseline_combined, phase_field, ls_field, roi, OUTPUT_DIR)
+    save_outputs(metrics_df, b1_maps, roi, OUTPUT_DIR, subject_id)
     
     print(f"\n{'='*70}")
     print("Analysis complete!")
     print(f"{'='*70}")
+    print(f"\nBest shimming method (lowest CV): {metrics_df.iloc[0]['Method']}")
+    print(f"  Mean B1+: {metrics_df.iloc[0]['Mean']:.2f} nT/V")
+    print(f"  CV: {metrics_df.iloc[0]['CV']:.2f}%")
+    print(f"\nOutputs saved to: {OUTPUT_DIR}")
 
 
 if __name__ == "__main__":
     main()
-
