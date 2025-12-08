@@ -1,0 +1,8 @@
+Parameter,Value
+max_displacement_mm,110.07709073208126
+mean_displacement_mm,39.43197244616937
+min_percent_scale_change,-104.52601517021148
+max_percent_scale_change,22.15940999242938
+grid_size,200.0
+alpha,0.0001
+G0,1.0
