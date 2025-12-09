@@ -1,30 +1,3 @@
-# LSQ Shim Optimizer - Standard Method for Shimming
-
-This optimizer implements the **STANDARD approach** used in shimming literature:
-- **Method**: `scipy.optimize.lsq_linear` with Bounded-Variable Least Squares (BVLS)
-- **Problem Type**: Linear least squares with bounds
-- **Optimality**: Guaranteed global optimum (convex problem)
-- **Literature**: Juchem et al. (MRM 2011), Shimming-Toolbox, Stockmann & Wald (2018)
-
-## Why This Method?
-
-Shimming is fundamentally a **linear least squares problem**:
-```
-minimize ||A*w + B0 - constant||² + α*||w||²
-subject to: lower ≤ w ≤ upper
-```
-
-This is exactly what `lsq_linear` solves efficiently!
-
-## Advantages over General Optimizers
-
-| Feature | LSQ (This) | L-BFGS-B | Trust-Region |
-|---------|------------|----------|--------------|
-| **Speed** | ⭐⭐⭐⭐⭐ | ⭐⭐⭐⭐ | ⭐⭐⭐ |
-| **Optimality** | ⭐⭐⭐⭐⭐ Global | ⭐⭐⭐ Local | ⭐⭐⭐⭐ |
-| **Stability** | ⭐⭐⭐⭐⭐ | ⭐⭐⭐⭐ | ⭐⭐⭐⭐⭐ |
-| **Shimming Standard** | ✅ YES | ❌ No | Sometimes |
-
 ## Installation
 
 ```bash
@@ -65,17 +38,6 @@ bash run.sh --subject 02 --acq CoV
 # Verbose output
 bash run.sh --subject 01 --acq CP --verbose
 ```
-
-## Key Differences from savart-optimizer
-
-| Feature | lsq-optimizer (This) | savart-optimizer |
-|---------|---------------------|------------------|
-| **Method** | lsq_linear (BVLS) | L-BFGS-B |
-| **Optimality** | Global optimum | Local optimum |
-| **Speed** | Faster (specialized) | Slower (general) |
-| **Bounds** | (-1000.0, 1000.0) | (-1.0, 1.0) |
-| **Standard** | ✅ YES (literature) | General purpose |
-| **Expected Improvement** | 30-40% | 3-5% |
 
 ## Configuration
 
@@ -165,31 +127,6 @@ This penalizes large weights while solving the least squares problem.
 >
 > — Juchem et al., Magnetic Resonance in Medicine, 2011
 
-## Performance Comparison
-
-### Expected Results
-
-| Metric | savart-optimizer | lsq-optimizer (This) |
-|--------|------------------|---------------------|
-| Improvement | 3.13% | **5-15%** |
-| Weights at bounds | All 8 | **0-2** (optimal) |
-| Optimization time | ~0.5s | **~0.1s** |
-| Method | General | **Specialized** |
-
-### Why Better Performance?
-
-1. **Larger Bounds**: (-5.0, 5.0) vs (-1.0, 1.0)
-   - Allows optimizer to find better solutions
-   - Not artificially constrained
-
-2. **Specialized Algorithm**: BVLS vs general L-BFGS-B
-   - Designed specifically for this problem type
-   - More efficient search
-
-3. **Guaranteed Global Optimum**: Convex problem
-   - No local minima to get stuck in
-   - Always finds the best solution
-
 ## Troubleshooting
 
 ### Issue: "Dataset directory not found"
@@ -224,59 +161,3 @@ shiming/
 - Try (-10.0, 10.0)
 - Try (-20.0, 20.0)
 - Check if improvement plateaus
-
-## Validation
-
-The optimizer logs comprehensive validation information:
-
-```
-✓ Optimization success
-✓ Weights in interior (not at bounds)
-✓ Positive improvement
-✓ Numerical stability
-```
-
-If weights are at bounds, the logger will warn you.
-
-## Comparison Script
-
-To compare this with other methods:
-```bash
-cd ../savart-optimizer
-python optimize_comparison.py
-```
-
-This will show speed and quality comparison across all methods.
-
-## Contributing
-
-To improve the optimizer:
-
-1. **Better Coil Geometries**: 
-   - Try 16 loops instead of 8
-   - Optimize coil radius for specific ROI
-
-2. **Multi-Objective**:
-   - Balance homogeneity vs power
-   - Pareto front analysis
-
-3. **Adaptive Regularization**:
-   - L-curve method for optimal α
-   - Cross-validation
-
-4. **3D Extension**:
-   - Use 3D field computations
-   - Optimize for volume ROI
-
-## License
-
-Same as parent repository.
-
-## Contact
-
-For questions about the LSQ optimizer implementation, see the main repository README.
-
----
-
-**Summary**: This is the STANDARD method for shimming. Use this instead of general optimizers for better results!
-
