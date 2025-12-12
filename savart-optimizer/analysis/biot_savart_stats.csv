@@ -1,8 +1,0 @@
-metric,value
-baseline_std,957.769566
-optimized_std,927.799004
-percent_reduction,3.13
-grid_N,200
-roi_radius_mm,25.0
-alpha,0.001
-optimizer_success,True
